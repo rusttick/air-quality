@@ -12,7 +12,7 @@ use embassy_rp::peripherals::{I2C0, I2C1, PIO0};
 use embassy_rp::pio::InterruptHandler as PioInterruptHandler;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
 use embassy_time::Instant;
-use portable_atomic::{AtomicI16, AtomicU64, Ordering};
+use portable_atomic::{AtomicI16, Ordering};
 
 use sen55::{DeviceStatus, Measurement, PmNumbers};
 
@@ -25,23 +25,23 @@ bind_interrupts!(pub struct Irqs {
     I2C1_IRQ => I2cInterruptHandler<I2C1>;    // SEN55 #1 outlet (Core 1)
 });
 
-// Boot time tracking for uptime calculation
-static BOOT_TICKS: AtomicU64 = AtomicU64::new(0);
-
-/// Initialize boot time - call at the very start of main()
-pub fn init_boot_time() {
-    BOOT_TICKS.store(Instant::now().as_ticks(), Ordering::Relaxed);
-}
-
-/// Get system uptime in seconds since boot
+/// System uptime in seconds. The RP2040 timer is reset by `embassy_rp::init`,
+/// so embassy's clock counts from boot.
 pub fn uptime_secs() -> u64 {
-    let boot_ticks = BOOT_TICKS.load(Ordering::Relaxed);
-    let boot = Instant::from_ticks(boot_ticks);
-    boot.elapsed().as_secs()
+    Instant::now().as_secs()
 }
+
+/// `TEMP_DECI_C` before the first reading
+const TEMP_UNKNOWN: i16 = i16::MIN;
 
 /// MCU temperature in 0.1°C units (e.g. 325 = 32.5°C), updated by temp_task
-pub static TEMP_DECI_C: AtomicI16 = AtomicI16::new(0);
+pub static TEMP_DECI_C: AtomicI16 = AtomicI16::new(TEMP_UNKNOWN);
+
+/// MCU temperature [°C]; None until temp_task has published its first reading
+pub fn mcu_temp_c() -> Option<f64> {
+    let deci = TEMP_DECI_C.load(Ordering::Relaxed);
+    (deci != TEMP_UNKNOWN).then(|| deci as f64 / 10.0)
+}
 
 // ============================================================================
 // SEN55 data shared from Core 1 (sensor tasks) to Core 0 (web)

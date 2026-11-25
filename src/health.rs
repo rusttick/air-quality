@@ -4,11 +4,17 @@
 //! The RP2040 hardware watchdog reboots the chip if it isn't fed within
 //! WATCHDOG_TIMEOUT. `watchdog_task` (Core 0) feeds it once a second, but only
 //! while every sensor task on Core 1 is still looping (each SENSOR_LOOPS[i]
-//! changed within STALL_LIMIT).
-//! So it reboots if either:
-//! - Core 0's executor hangs (the feeding task never runs), or
+//! changed within STALL_LIMIT) and the network loop on Core 0 is still
+//! advancing (NET_LOOPS changed within NET_STALL_LIMIT).
+//! So it reboots if any of these happen:
+//! - Core 0's executor hangs (the feeding task never runs)
 //! - Core 1 hangs or crashes, or one sensor task gets stuck (a SENSOR_LOOPS
-//!   counter stops changing).
+//!   counter stops changing)
+//! - the WiFi chip stops answering, so the network loop is stuck waiting for
+//!   it (NET_LOOPS stops changing). The reboot power-cycles the WiFi chip.
+//!
+//! An access point that is down does not cause a reboot: join attempts fail or
+//! time out, and each attempt counts as progress.
 //!
 //! While a debugger has a core halted, the watchdog is paused (hardware default).
 //!
@@ -23,7 +29,7 @@ use embassy_rp::watchdog::{ResetReason, Watchdog};
 use embassy_time::{Duration, Instant, Timer};
 
 use crate::NUM_SENSORS;
-use portable_atomic::{AtomicU32, AtomicU8, Ordering};
+use portable_atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 /// Reboot if the watchdog isn't fed for this long (RP2040 max is ~8.3 s)
 pub const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,12 +41,31 @@ const FEED_INTERVAL: Duration = Duration::from_secs(1);
 /// (Scratch 4-7 are reserved by the bootrom; 0-3 are free.)
 const PANIC_MAGIC: u32 = 0x5041_4E43; // "PANC"
 
-/// Stop feeding if any sensor loop counter hasn't changed for this long
+/// Stop feeding if any sensor loop counter hasn't changed for this long.
+/// The longest gap in a healthy sensor task is one timed-out init (2 s).
 const STALL_LIMIT: Duration = Duration::from_secs(3);
 
-/// Iterations of each sensor task (Core 1), counted whether or not the read
+/// Stop feeding if the network loop counter hasn't changed for this long.
+/// Must be well above the longest healthy step, one WiFi join attempt
+/// (`JOIN_TIMEOUT` in main.rs, 30 s), and above the WiFi chip's start-up
+/// (firmware upload, a few seconds).
+const NET_STALL_LIMIT: Duration = Duration::from_secs(90);
+
+/// Progress of each sensor task (Core 1), counted whether or not the read
 /// succeeded; watched by watchdog_task (Core 0)
 pub static SENSOR_LOOPS: [AtomicU32; NUM_SENSORS] = [const { AtomicU32::new(0) }; NUM_SENSORS];
+
+/// Progress of the network loop (Core 0): every WiFi join attempt and every
+/// link check; watched by watchdog_task
+pub static NET_LOOPS: AtomicU32 = AtomicU32::new(0);
+
+/// Times WiFi was rejoined because the link looked dead (for /api/status)
+pub static WIFI_REJOINS: AtomicU32 = AtomicU32::new(0);
+
+/// Call from the network loop whenever it makes progress
+pub fn net_alive() {
+    NET_LOOPS.fetch_add(1, Ordering::Relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // Reset cause
@@ -112,62 +137,57 @@ pub fn reset_cause() -> ResetCause {
 }
 
 // ---------------------------------------------------------------------------
-// WiFi state (for status display)
-// ---------------------------------------------------------------------------
-
-/// WiFi connection state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
-#[repr(u8)]
-pub enum WifiState {
-    /// Trying to join, no failure yet
-    Joining = 0,
-    /// Joined and network stack up
-    Connected = 1,
-    /// Join attempts are failing (still retrying)
-    Failing = 2,
-}
-
-static WIFI_STATE: AtomicU8 = AtomicU8::new(WifiState::Joining as u8);
-
-/// Record the WiFi state
-pub fn set_wifi_state(state: WifiState) {
-    WIFI_STATE.store(state as u8, Ordering::Relaxed);
-}
-
-/// Current WiFi state
-pub fn wifi_state() -> WifiState {
-    match WIFI_STATE.load(Ordering::Relaxed) {
-        1 => WifiState::Connected,
-        2 => WifiState::Failing,
-        _ => WifiState::Joining,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Watchdog task
 // ---------------------------------------------------------------------------
 
-/// Starts the watchdog and feeds it while every sensor task keeps looping.
+/// Tracks whether one progress counter is still changing
+struct Progress {
+    last: u32,
+    changed_at: Instant,
+}
+
+impl Progress {
+    fn new() -> Self {
+        Self {
+            last: 0,
+            changed_at: Instant::now(),
+        }
+    }
+
+    /// True if `count` has changed within `limit`
+    fn is_alive(&mut self, count: u32, limit: Duration) -> bool {
+        if count != self.last {
+            self.last = count;
+            self.changed_at = Instant::now();
+            true
+        } else {
+            self.changed_at.elapsed() <= limit
+        }
+    }
+}
+
+/// Starts the watchdog and feeds it while every sensor task and the network
+/// loop keep making progress.
 #[embassy_executor::task]
 pub async fn watchdog_task(mut watchdog: Watchdog) -> ! {
     info!("[watchdog] starting, timeout {}ms", WATCHDOG_TIMEOUT.as_millis());
     watchdog.start(WATCHDOG_TIMEOUT);
 
-    let mut last_loops = [0u32; NUM_SENSORS];
-    let mut last_change = [Instant::now(); NUM_SENSORS];
+    let mut sensors: [Progress; NUM_SENSORS] = core::array::from_fn(|_| Progress::new());
+    let mut net = Progress::new();
     loop {
         Timer::after(FEED_INTERVAL).await;
 
         let mut all_alive = true;
-        for i in 0..NUM_SENSORS {
-            let loops = SENSOR_LOOPS[i].load(Ordering::Relaxed);
-            if loops != last_loops[i] {
-                last_loops[i] = loops;
-                last_change[i] = Instant::now();
-            } else if last_change[i].elapsed() > STALL_LIMIT {
-                warn!("[watchdog] sensor {} loop stalled at {}; not feeding", i, loops);
+        for (i, sensor) in sensors.iter_mut().enumerate() {
+            if !sensor.is_alive(SENSOR_LOOPS[i].load(Ordering::Relaxed), STALL_LIMIT) {
+                warn!("[watchdog] sensor {} loop stalled; not feeding", i);
                 all_alive = false;
             }
+        }
+        if !net.is_alive(NET_LOOPS.load(Ordering::Relaxed), NET_STALL_LIMIT) {
+            warn!("[watchdog] network loop stalled; not feeding");
+            all_alive = false;
         }
         if all_alive {
             watchdog.feed();
@@ -179,16 +199,28 @@ pub async fn watchdog_task(mut watchdog: Watchdog) -> ! {
 // Panic handler support
 // ---------------------------------------------------------------------------
 
+/// Set once a panic is being handled, on either core
+static PANICKING: AtomicBool = AtomicBool::new(false);
+
 /// Log a panic, mark it in a scratch register, and reboot via the watchdog.
 /// Call from the binary's `#[panic_handler]`.
 pub fn panic_reboot(info: &core::panic::PanicInfo) -> ! {
-    defmt::error!("[panic] {}", defmt::Display2Format(info));
+    // Stop this core's interrupt handlers from running on top of the panic
+    cortex_m::interrupt::disable();
 
+    // Mark first: if anything below goes wrong, the hardware watchdog still
+    // resets the chip and the next boot still reports a panic
     let watchdog = pac::WATCHDOG;
     watchdog.scratch0().write(|w| *w = PANIC_MAGIC);
 
-    // ~200 ms at 125 MHz so an attached debug probe can read the log before reset
-    cortex_m::asm::delay(25_000_000);
+    // Log only the first panic. Logging can itself panic (e.g. a panic inside
+    // a log statement, while the logger is held), which would recurse.
+    if !PANICKING.swap(true, Ordering::Relaxed) {
+        defmt::error!("[panic] {}", defmt::Display2Format(info));
+
+        // About 0.3 s at 125 MHz so an attached debug probe can read the log before reset
+        cortex_m::asm::delay(25_000_000);
+    }
 
     // Reset everything except the oscillators (same as embassy's Watchdog::trigger_reset)
     pac::PSM

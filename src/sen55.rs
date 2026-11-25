@@ -35,8 +35,9 @@ mod cmd {
 
 /// Sentinel the sensor returns for unknown u16 values
 const UNKNOWN_U16: u16 = 0xFFFF;
-/// Sentinel for unknown i16 values (datasheet says 0xFFFF for all fields, but the
-/// raw-values addendum and Sensirion's drivers use 0x7FFF for signed ones)
+/// Sentinel for unknown i16 values. The datasheet says 0xFFFF for all fields, but
+/// the raw-values addendum and Sensirion's drivers use 0x7FFF for signed ones.
+/// 0xFFFF is handled too where it can't be a real value: see `scale_i16_non_negative`.
 const UNKNOWN_I16: i16 = 0x7FFF;
 
 /// Largest read: product name / serial number = 16 words x 3 bytes
@@ -155,10 +156,18 @@ fn scale_u16(v: u16, div: f64) -> Option<f64> {
     (v != UNKNOWN_U16).then(|| v as f64 / div)
 }
 
+/// Signed value that can be negative (temperature)
 fn scale_i16(v: u16, div: f64) -> Option<f64> {
     let v = v as i16;
     // Only 0x7FFF: a signed 0xFFFF (-1) is a valid reading, e.g. -0.005 °C
     (v != UNKNOWN_I16).then(|| v as f64 / div)
+}
+
+/// Signed value that is never negative (humidity, VOC Index, NOx Index).
+/// Rejects 0x7FFF and also the datasheet's 0xFFFF, which reads as -1.
+fn scale_i16_non_negative(v: u16, div: f64) -> Option<f64> {
+    let v = v as i16;
+    (v != UNKNOWN_I16 && v >= 0).then(|| v as f64 / div)
 }
 
 pub struct Sen55<I2C> {
@@ -290,10 +299,10 @@ impl<I2C: I2c> Sen55<I2C> {
             pm2_5: scale_u16(w[1], 10.0),
             pm4_0: scale_u16(w[2], 10.0),
             pm10: scale_u16(w[3], 10.0),
-            humidity: scale_i16(w[4], 100.0),
+            humidity: scale_i16_non_negative(w[4], 100.0),
             temperature: scale_i16(w[5], 200.0),
-            voc_index: scale_i16(w[6], 10.0),
-            nox_index: scale_i16(w[7], 10.0),
+            voc_index: scale_i16_non_negative(w[6], 10.0),
+            nox_index: scale_i16_non_negative(w[7], 10.0),
         })
     }
 

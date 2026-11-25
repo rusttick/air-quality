@@ -4,13 +4,14 @@ Two Sensirion SEN55 air quality sensors, one before (`inlet`) and one after (`ou
 filter, on a Raspberry Pi Pico W (RP2040 + CYW43439), in Rust with embassy. Serves readings as
 JSON over WiFi.
 
-Sensor interface summary: [doc/sen55_interface.md](doc/sen55_interface.md)
+- Sensor interface summary: [doc/sen55_interface.md](doc/sen55_interface.md)
+- Wiring a sensor over ~3 m of cable: [Cat6](doc/wiring_cat6.md) or [S-video](doc/wiring_svideo.md)
 
 ## Architecture
 
 | Core | Tasks |
 |---|---|
-| 0 | WiFi (cyw43 on PIO0 + DMA_CH0), embassy-net, picoserve web server, MCU temp, watchdog |
+| 0 | WiFi (cyw43 on PIO0 + DMA_CH0) and its link check, embassy-net, picoserve web server, MCU temp, watchdog |
 | 1 | `sensor0_task` (inlet, I2C0) and `sensor1_task` (outlet, I2C1), 1 Hz each |
 
 The SEN55's I2C address (0x69) is fixed, so each sensor gets its own hardware I2C bus. Both tasks
@@ -18,12 +19,33 @@ run the same generic loop (`sensor_task::run`).
 
 Each task publishes its readings to `SENSOR_DATA[i]` (an embassy-sync `Watch` over a
 critical-section mutex, i.e. the RP2040 hardware spinlock). The web handlers on Core 0 read the
-latest value with `try_get()`. Each task bumps `health::SENSOR_LOOPS[i]` every loop; the watchdog
-on Core 0 only feeds while every counter has moved in the last 3 s, so a hang on either core (or
-in either sensor task) reboots the board.
+latest value with `try_get()`.
 
-A sensor is reset and restarted automatically after 5 consecutive failed reads, so a loose
-cable recovers without a reboot. A missing sensor doesn't affect the other one.
+### Recovery
+
+- **Hangs:** each sensor task bumps `health::SENSOR_LOOPS[i]` every loop. The watchdog on Core 0
+  only feeds while every counter has moved in the last 3 s, so a hang on either core (or in
+  either sensor task) reboots the board. It also stops feeding if the network loop on Core 0
+  makes no progress for 90 s, which means the WiFi chip has stopped answering. An access point
+  that is down doesn't cause a reboot.
+- **Sensor errors:** a sensor is reset and restarted automatically after 5 consecutive failed
+  reads, so a loose cable recovers without a reboot. A missing sensor doesn't affect the
+  other one.
+- **Sensor power glitch:** a sensor that loses power briefly comes back in Idle mode. It answers
+  on I2C but produces no data. After 30 s without new data the sensor is restarted.
+- **Stuck I2C bus:** the sensors stay powered while the RP2040 resets, so a reset in the middle of
+  a read can leave a sensor holding SDA low. Before every sensor start, and after any I2C
+  transaction that timed out, the task clocks SCL by hand until the sensor releases the bus,
+  then resets the RP2040's I2C block. If a line stays low, the log shows
+  `I2C bus is stuck low`.
+- **WiFi:** the WiFi driver doesn't report a lost link, so Core 0 checks the network itself. If
+  the gateway hasn't answered a ping and no HTTP request has arrived for 60 s, it leaves and
+  rejoins the network, and keeps retrying until the access point is back. `wifi_rejoins` in
+  `/api/status` counts these. If your gateway ignores pings, poll the device at least once a
+  minute. Otherwise it rejoins while nobody is polling: first after 1 minute, then at intervals
+  that double up to 16 minutes. A request that arrives during a rejoin fails.
+
+Restarting a sensor resets its VOC and NOx learning (see `measuring_secs`).
 
 ## Wiring
 
@@ -36,22 +58,32 @@ cable recovers without a reboot. A missing sensor doesn't affect the other one.
 | 5 SEL | GND | GND |
 | 6 NC | — | — |
 
-Each SDA and SCL line needs its own 10 kΩ pull-up to 3V3 (pin 36), four resistors in total.
+Each SDA and SCL line needs its own pull-up to 3V3 (pin 36), four resistors in total: 10 kΩ
+for wires under 10 cm, or 3.3 kΩ plus series resistors for ~3 m cables (see the wiring
+documents above).
 
 - Each SEN55 needs 5 V at 63 mA average, up to 110 mA peak. Two sensors plus the Pico W fit
   within a 500 mA USB supply. VSYS sits a diode drop below VBUS, so take 5 V from VBUS.
 - Pull-ups go to **3.3 V**, not 5 V. The SEN55 I/O accepts 3.3 V logic, so no level shifter
   is needed.
-- Keep I2C wires under 10 cm or use shielded cable.
+- Sensirion recommends I2C wires under 10 cm, or shielded cable. The firmware runs the bus at
+  10 kHz so that ~3 m cables wired as in the wiring documents work too.
 - The SEN55's metal shield is connected to GND internally. Don't connect the shield to anything
   at a different potential.
 
 ## Build & flash
 
-WiFi credentials and the static IP are compiled in from environment variables:
+WiFi credentials and the static IP are compiled in from environment variables. The build
+checks them and fails on a bad value:
+
+| Variable | Requirement |
+|---|---|
+| `SSID` | 1 to 32 bytes |
+| `PASSWORD` | WPA2 passphrase, 8 to 63 bytes (open networks aren't supported) |
+| `IP` | IPv4 address in a /24 network, last number 2 to 254. The gateway must be `x.x.x.1`. |
 
 ```bash
-export SSID=... PASSWORD=... IP=192.168.1.50   # /24, gateway x.x.x.1
+export SSID=... PASSWORD=... IP=192.168.1.50
 cargo build
 cargo embed          # flash + RTT log via debug probe (Embed.toml)
 cargo run            # or: probe-rs run (runner in .cargo/config.toml)
@@ -63,6 +95,10 @@ CORS is open (`*`). All values are JSON; unknown/invalid sensor values are `null
 
 The device has no wall-clock time. The polling service should timestamp each reading
 as `its own clock - age_secs`.
+
+A sensor that goes offline keeps its last reading, and `age_secs` keeps growing. Ignore
+readings older than a few seconds. The sensor doesn't update its values during its weekly
+10 s fan cleaning: for those 10 s the values repeat, or `age_secs` grows to about 10.
 
 ### `GET /api/air`
 One entry per sensor, in index order (`inlet`, then `outlet`):
@@ -88,7 +124,7 @@ One entry per sensor, in index order (`inlet`, then `outlet`):
   ]
 }
 ```
-A sensor's `reading` is `null` until its first measurement arrives. Use `measuring_secs` to judge warm-up:
+A sensor's `reading` and `age_secs` are `null` until its first measurement arrives. Use `measuring_secs` to judge warm-up:
 PM is stable after ~30 s, the VOC Index meets spec after ~1 h, the NOx Index after ~6 h.
 (Example values above are illustrative.)
 
@@ -96,7 +132,7 @@ PM is stable after ~30 s, the VOC Index meets spec after ~1 h, the NOx Index aft
 ```json
 {
   "uptime_secs": 130, "mcu_temp_c": 27.4,
-  "last_reset": "power_on",
+  "last_reset": "power_on", "wifi_rejoins": 0,
   "sensors": [
     { "name": "inlet",  "online": true, "errors": 0,
       "info": { "product": "SEN55", "serial": "...", "firmware": 2 } },
@@ -104,6 +140,15 @@ PM is stable after ~30 s, the VOC Index meets spec after ~1 h, the NOx Index aft
   ]
 }
 ```
+- `last_reset` is `power_on`, `watchdog` (something hung), `panic` or `forced`.
+- `mcu_temp_c` is `null` for the first 2 s after boot.
+- `wifi_rejoins` counts how often WiFi was rejoined because the network went quiet (see
+  Recovery).
+- `online` is true while the sensor is started and measuring. It goes false when the sensor is
+  being restarted, and stays false while the sensor is missing.
+- `errors` counts failed read cycles and failed start attempts since boot. A missing sensor
+  adds one every second or so, so watch whether it is still rising, not whether it is 0.
+- `info` is `null` until the sensor has been started once.
 
 ## Measuring a filter
 

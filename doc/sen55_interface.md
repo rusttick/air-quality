@@ -36,13 +36,18 @@ supply for the 110 mA peak.
 - VIH ≥ 2.31 V, VIL ≤ 0.99 V, VOL ≤ 0.4 V @ < 6 mA sink. I/O pins tolerate up to 5.5 V.
 - A 3.3 V MCU can drive the bus directly with pull-ups to 3.3 V. **No level shifter is needed.**
 - Use external pull-ups on SDA and SCL (the datasheet example uses 10 kΩ).
-- Keep I²C wires < 10 cm, or use shielded cable.
+- Keep I²C wires < 10 cm, or use shielded cable. For the ~3 m cables in this project, see
+  [wiring_cat6.md](wiring_cat6.md) and [wiring_svideo.md](wiring_svideo.md): 3.3 kΩ
+  pull-ups, series resistors, and a 10 kHz clock.
 
 ### Gotchas
 - **GND is internally connected to the metal shield.** Leave the shield floating, or
   make sure the shield and GND are at the same potential. Current through the shield
   can damage the part.
 - ESD-sensitive (±4 kV contact). Handle accordingly.
+- **The sensor keeps its power when the MCU resets.** If the MCU resets in the middle of a
+  read, the sensor can be left holding SDA low. Clock SCL up to 9 times until SDA is released,
+  then send a STOP (the firmware does this in `bus_clear`, `src/sensor_task.rs`).
 
 ## 2. I²C protocol
 
@@ -74,6 +79,11 @@ Power-on/Reset ─► Idle ──0x0021──► Measurement (PM+RHT+VOC+NOx, 1 
 ```
 Switching directly between Measurement and RHT/Gas-only requires firmware ≥ v2.
 Otherwise, go through Idle.
+
+A sensor that loses power, even briefly, is back in Idle. It still answers every command, but
+Read Data-Ready stays 0x00. Detect this by the missing data, not by I²C errors, and start
+the measurement again (the firmware does this after 30 s
+without new data).
 
 ### Command set
 | Cmd | Name | Exec time | Notes |
@@ -131,7 +141,9 @@ failing fan.
 | 7 | i16 | ÷10 | NOx Index | 0x7FFF |
 
 The datasheet says "0xFFFF if unknown" for all values. The raw-values addendum and
-Sensirion's drivers use 0x7FFF for the signed fields. Treat both as invalid.
+Sensirion's drivers use 0x7FFF for the signed fields. Treat 0x7FFF as invalid for all
+signed fields. Treat 0xFFFF (-1) as invalid for humidity, VOC Index and NOx Index, which
+are never negative. For temperature, 0xFFFF is a real reading (-0.005 °C).
 
 Reading these values clears the data-ready flag. Without new data, the sensor returns
 the previous values again.
@@ -154,7 +166,8 @@ Raw NOx reads 0xFFFF for the first 10–11 s. No specifications are given for ra
   directly. Their precision is ±25 µg/m³ / ±25%, so treat them as rough values.
 - Start-up: 8 s at normal concentrations, up to 30 s in very clean air (50–100 #/cm³).
   Discard readings from that window.
-- Values freeze for 10 s during fan cleaning (status bit 19).
+- Values freeze for 10 s during fan cleaning (status bit 19). Don't treat this pause as a
+  failed sensor.
 - Spec definitions: [Sensirion_Particulate_Matter_AppNotes_Specification_Statement.pdf](https://sensirion.com/media/documents/B7AAA101/61653FB8/Sensirion_Particulate_Matter_AppNotes_Specification_Statement.pdf)
 
 ### Temperature & humidity
@@ -190,7 +203,8 @@ Raw NOx reads 0xFFFF for the first 10–11 s. No specifications are given for ra
    acceleration mode and warm start; restore the VOC state.
 5. `0x0021` start measurement, wait 50 ms.
 6. Loop every 1 s: `0x0202` data-ready, then `0x03C4` read values.
-   Check `0xD206` status periodically.
+   Check `0xD206` status periodically. If data-ready stays 0 for much longer than a fan
+   cleaning (10 s), go back to step 2.
 7. Before shutdown: back up the VOC state with `0x6181`.
 
 To save power, alternate Measurement mode with RHT/Gas-only mode. This cuts average

@@ -6,13 +6,13 @@
 //!
 //! Multicore architecture:
 //! - Core 0: WiFi, web server, MCU temperature, watchdog
-//!
-//! No wall-clock time on the device: the polling service timestamps readings
-//! (each reading reports `age_secs`).
 //! - Core 1: one SEN55 task per I2C bus
 //!
 //! Core 1 publishes readings to `SENSOR_DATA[i]` (embassy-sync Watch, critical-section
 //! mutex = RP2040 hardware spinlock), which the web handlers on Core 0 read.
+//!
+//! No wall-clock time on the device: the polling service timestamps readings
+//! (each reading reports `age_secs`).
 //!
 //! Hardware:
 //! - GP4 / GP5: I2C0 SDA / SCL to SEN55 #0 "inlet" (Core 1)
@@ -32,35 +32,58 @@ use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
 use defmt::{info, warn};
 use defmt_rtt as _;
 use embassy_executor::Executor;
+use embassy_net::icmp::PacketMetadata;
+use embassy_net::icmp::ping::{PingManager, PingParams};
 use embassy_net::{Config as NetConfig, Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4};
 use embassy_rp::adc::{Adc, Channel, Config as AdcConfig};
+use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::multicore::{Stack, spawn_core1};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::Pio;
 use embassy_rp::watchdog::Watchdog;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use picoserve::{
     AppBuilder, AppRouter, make_static,
     response::{IntoResponse, Json},
     routing::get,
 };
-use portable_atomic::Ordering;
+use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
-use air_quality::health::{self, WifiState};
+use air_quality::health;
 use air_quality::sensor_task::{
     SENSOR_ERRORS, SENSOR_ONLINE, Sensor0Resources, Sensor1Resources, sensor0_task, sensor1_task,
 };
 use air_quality::temp_task::temp_task;
 use air_quality::{
-    Irqs, NUM_SENSORS, SENSOR_DATA, SENSOR_INFO, SENSOR_NAMES, SensorData, SensorInfo,
-    TEMP_DECI_C, init_boot_time, uptime_secs,
+    Irqs, NUM_SENSORS, SENSOR_DATA, SENSOR_INFO, SENSOR_NAMES, SensorData, SensorInfo, mcu_temp_c,
+    uptime_secs,
 };
 
 // WiFi credentials - set via environment variables at build time
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
+
+/// Give up on one WiFi join attempt after this long and try again. cyw43's
+/// `join` waits for an event from the chip and has no timeout of its own.
+/// Keep well below `NET_STALL_LIMIT` in health.rs.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for the gateway to answer one ping
+const PING_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Rejoin WiFi when the network has shown no sign of life (no ping reply from
+/// the gateway and no HTTP request) for this long
+const LINK_DEAD_AFTER: Duration = Duration::from_secs(60);
+
+/// If rejoining doesn't bring any sign of life, wait twice as long before each
+/// further rejoin, up to this. This limits the churn on a network where the
+/// gateway ignores pings and nobody is polling.
+const LINK_DEAD_AFTER_MAX: Duration = Duration::from_secs(16 * 60);
+
+/// HTTP requests handled since boot. A request arriving proves the WiFi link works.
+static HTTP_REQUESTS: AtomicU32 = AtomicU32::new(0);
 
 // Multicore statics
 // Sensor tasks are small (I2C + a few structs); 16 KB leaves plenty of headroom
@@ -98,9 +121,11 @@ struct SensorStatus {
 #[derive(serde::Serialize)]
 struct StatusResponse {
     uptime_secs: u64,
-    /// RP2040 internal temperature [°C]
-    mcu_temp_c: f64,
+    /// RP2040 internal temperature [°C] (None for the first ~2 s after boot)
+    mcu_temp_c: Option<f64>,
     last_reset: &'static str,
+    /// Times WiFi was rejoined because the network stopped answering
+    wifi_rejoins: u32,
     sensors: [SensorStatus; NUM_SENSORS],
 }
 
@@ -120,10 +145,12 @@ struct AirResponse {
 }
 
 async fn status_handler() -> impl IntoResponse {
+    HTTP_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let status = StatusResponse {
         uptime_secs: uptime_secs(),
-        mcu_temp_c: TEMP_DECI_C.load(Ordering::Relaxed) as f64 / 10.0,
+        mcu_temp_c: mcu_temp_c(),
         last_reset: health::reset_cause().as_str(),
+        wifi_rejoins: health::WIFI_REJOINS.load(Ordering::Relaxed),
         sensors: core::array::from_fn(|i| SensorStatus {
             name: SENSOR_NAMES[i],
             online: SENSOR_ONLINE[i].load(Ordering::Relaxed),
@@ -135,6 +162,7 @@ async fn status_handler() -> impl IntoResponse {
 }
 
 async fn air_handler() -> impl IntoResponse {
+    HTTP_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let now = uptime_secs();
     let air = AirResponse {
         sensors: core::array::from_fn(|i| {
@@ -151,6 +179,7 @@ async fn air_handler() -> impl IntoResponse {
 
 /// OPTIONS - CORS preflight handler
 async fn options_handler() -> impl IntoResponse {
+    HTTP_REQUESTS.fetch_add(1, Ordering::Relaxed);
     (CORS_HEADERS, "")
 }
 
@@ -202,26 +231,23 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 /// Turns LED off while connecting, on when network stack is ready
 async fn join_wifi(control: &mut cyw43::Control<'static>, stack: embassy_net::Stack<'static>) {
     control.gpio_set(0, false).await;
-    health::set_wifi_state(WifiState::Joining);
     loop {
+        // Every attempt counts as progress for the watchdog: an access point
+        // that is down must not cause a reboot
+        health::net_alive();
         info!("joining SSID = \"{}\"", SSID);
-        match control
-            .join(SSID, JoinOptions::new(PASSWORD.as_bytes()))
-            .await
-        {
-            Ok(()) => {
+        let join = control.join(SSID, JoinOptions::new(PASSWORD.as_bytes()));
+        match with_timeout(JOIN_TIMEOUT, join).await {
+            Ok(Ok(())) => {
                 info!("connected to SSID = \"{}\"", SSID);
                 stack.wait_config_up().await;
                 control.gpio_set(0, true).await;
-                health::set_wifi_state(WifiState::Connected);
                 return;
             }
-            Err(e) => {
-                warn!("failed to join SSID = \"{}\": {}", SSID, e.status);
-                health::set_wifi_state(WifiState::Failing);
-                Timer::after_secs(1).await;
-            }
+            Ok(Err(e)) => warn!("failed to join SSID = \"{}\": {}", SSID, e.status),
+            Err(_) => warn!("joining SSID = \"{}\" timed out", SSID),
         }
+        Timer::after_secs(1).await;
     }
 }
 
@@ -240,10 +266,10 @@ async fn core0_main_task(
     watchdog: Watchdog,
 ) -> ! {
     info!("spawn watchdog_task");
-    spawner.spawn(health::watchdog_task(watchdog)).ok();
+    spawner.spawn(health::watchdog_task(watchdog)).unwrap();
 
     info!("spawn temp_task");
-    spawner.spawn(temp_task(adc, temp_sensor)).ok();
+    spawner.spawn(temp_task(adc, temp_sensor)).unwrap();
 
     info!("Load the CYW43 firmware bytes");
     let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
@@ -266,7 +292,7 @@ async fn core0_main_task(
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
 
     info!("spawn cyw43_task");
-    spawner.spawn(cyw43_task(runner)).ok();
+    spawner.spawn(cyw43_task(runner)).unwrap();
 
     info!("initialize cyw43 controller");
     control.init(clm).await;
@@ -288,26 +314,27 @@ async fn core0_main_task(
     gateway_octets[3] = 1;
     let gateway: Ipv4Address = gateway_octets.into();
 
-    let dns_server: Ipv4Address = "1.1.1.1".parse().unwrap();
     let net_config = NetConfig::ipv4_static(StaticConfigV4 {
         address: cidr,
         gateway: Some(gateway),
-        dns_servers: heapless::Vec::from_slice(&[dns_server]).unwrap(),
+        // The device only answers requests; it never looks up a name
+        dns_servers: heapless::Vec::new(),
     });
 
-    // Sockets: web server (1) + DNS (1) + spare
-    static STACK_RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
+    // Sockets: web server (1) + gateway ping (1) + spare
+    static STACK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 
     info!("configure network: {:?}", net_config);
     let (stack, runner) = embassy_net::new(
         net_device,
         net_config,
         STACK_RESOURCES.init(StackResources::new()),
-        0x0123_4567_89ab_cdef,
+        // Random seed, so TCP sequence numbers and ports differ after every reboot
+        RoscRng.next_u64(),
     );
 
     info!("spawn net_task");
-    spawner.spawn(net_task(runner)).ok();
+    spawner.spawn(net_task(runner)).unwrap();
 
     join_wifi(&mut control, stack).await;
 
@@ -323,19 +350,59 @@ async fn core0_main_task(
         })
         .keep_connection_alive()
     );
-    spawner.spawn(web_task(stack, app, web_config)).ok();
+    spawner.spawn(web_task(stack, app, web_config)).unwrap();
 
-    // Blink the onboard LED as a heartbeat; rejoin WiFi if the link drops
+    // Gateway ping, used below to tell whether the WiFi link still works
+    let mut ping_rx_meta = [PacketMetadata::EMPTY];
+    let mut ping_tx_meta = [PacketMetadata::EMPTY];
+    let mut ping_rx_buffer = [0; 128];
+    let mut ping_tx_buffer = [0; 128];
+    let mut ping = PingManager::new(
+        stack,
+        &mut ping_rx_meta,
+        &mut ping_rx_buffer,
+        &mut ping_tx_meta,
+        &mut ping_tx_buffer,
+    );
+    let mut ping_params = PingParams::new(gateway);
+    ping_params
+        .set_count(1)
+        .set_timeout(PING_TIMEOUT)
+        .set_rate_limit(Duration::from_ticks(0));
+
+    // Blink the onboard LED as a heartbeat; rejoin WiFi if the network goes quiet.
+    //
+    // cyw43 0.6 never reports a lost link (`stack.is_link_up()` stays true after
+    // the first join), so the link is checked from above instead: it is alive if
+    // an HTTP request arrived or the gateway answered a ping.
+    let mut last_requests = HTTP_REQUESTS.load(Ordering::Relaxed);
+    let mut last_alive = Instant::now();
+    let mut dead_after = LINK_DEAD_AFTER;
     loop {
-        Timer::after_secs(2).await;
+        health::net_alive();
+
         control.gpio_set(0, false).await;
         Timer::after_secs(2).await;
+        control.gpio_set(0, true).await;
+        Timer::after_secs(2).await;
 
-        if stack.is_link_up() {
-            control.gpio_set(0, true).await;
-        } else {
-            warn!("net stack link down, reconnecting...");
+        let requests = HTTP_REQUESTS.load(Ordering::Relaxed);
+        let alive = requests != last_requests || ping.ping(&ping_params).await.is_ok();
+        last_requests = requests;
+
+        if alive {
+            last_alive = Instant::now();
+            dead_after = LINK_DEAD_AFTER;
+        } else if last_alive.elapsed() >= dead_after {
+            warn!(
+                "no ping reply from gateway and no HTTP request for {} s; rejoining WiFi",
+                last_alive.elapsed().as_secs()
+            );
+            health::WIFI_REJOINS.fetch_add(1, Ordering::Relaxed);
+            control.leave().await;
             join_wifi(&mut control, stack).await;
+            last_alive = Instant::now();
+            dead_after = (dead_after * 2).min(LINK_DEAD_AFTER_MAX);
         }
     }
 }
@@ -343,8 +410,6 @@ async fn core0_main_task(
 /// Entry point - sets up multicore execution
 #[cortex_m_rt::entry]
 fn main() -> ! {
-    init_boot_time();
-
     info!("air-quality: multicore starting");
     let p = embassy_rp::init(Default::default());
 

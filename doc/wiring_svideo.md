@@ -61,7 +61,7 @@ Shared on the Pico W: 3V3(OUT) pin 36 (pull-ups only), VBUS pin 40 (sensor power
 | Part | Where | Value | Why |
 |---|---|---|---|
 | Pull-ups | Pico end, SDA and SCL to **3.3 V** | 3.3 kΩ (4.7 kΩ also fine) | Thin S-video coax is about 55–100 pF/m, so 3 m is roughly 200–300 pF per line. 3.3 kΩ gives a ~0.6–0.9 µs rise. That's fine at 10 kHz and borderline at 100 kHz. Never pull up to 5 V. |
-| Series resistors | Both ends, on SDA and SCL | 100 Ω | Limit the current when a driver discharges the coax. Into 75 Ω, the initial current would otherwise approach the SEN55's ±16 mA pin limit. They also damp reflections on the unterminated line, and add only ~0.1 V to the low level. |
+| Series resistors | Both ends, on SDA and SCL | 100 Ω | Limit the current when a driver discharges the coax. Into 75 Ω, the initial current would otherwise approach the SEN55's ±16 mA pin limit. They also damp reflections on the unterminated line, and add only ~0.2 V to the low level the Pico sees. |
 | Decoupling | Sensor end, VDD to GND | 10 µF + 100 nF | Absorbs the fan's and laser's 110 mA current pulses locally. |
 | SEL | Sensor end | Tie to GND | Selects I²C. |
 
@@ -95,6 +95,10 @@ These are set in `src/sensor_task.rs`:
 - **Internal pull-ups off:** embassy-rp's `i2c::Config::default()` enables the RP2040's internal
   pull-ups on SDA and SCL. With external 3.3 kΩ pull-ups, set `config.sda_pullup = false` and
   `config.scl_pullup = false`.
+- **Recovery:** the firmware restarts a sensor after 5 failed read cycles in a row, or after
+  30 s without new data, so a sensor can be unplugged and replugged while the Pico is running.
+  Before each start it frees the bus if the sensor is holding SDA low. This relies on the
+  external pull-ups.
 
 ## Bring-up checks
 
@@ -103,7 +107,12 @@ These are set in `src/sensor_task.rs`:
    pin 4 to pins 1/2.
 2. Power up without the sensor. Measure about 5 V on the power cable at the sensor end, and
    about 3.3 V on mini-DIN pins 3 and 4 (the pull-ups) at the sensor end.
-3. Plug in the sensor. The log should show `[sensor 0] inlet: SEN55 serial … measuring`, and
-   `/api/status` should report `"online": true` with `"errors": 0`.
+3. Plug in the sensor. Within a few seconds the log should show
+   `[sensor 0] inlet: SEN55 serial … measuring`, and `/api/status` should report
+   `"online": true`. `"errors"` counted one failed start per second while the sensor was
+   unplugged; it should now stop rising.
 4. Optional, with a scope: the SCL low level at the Pico is under 0.8 V, and the edges are clean
    with no double steps.
+
+If the log shows `I2C bus is stuck low (check wiring and pull-ups)`, SDA or SCL reads low
+while idle: a pull-up is missing, or the line is shorted to GND.
