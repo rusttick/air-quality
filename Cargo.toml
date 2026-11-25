@@ -1,0 +1,58 @@
+[package]
+edition = "2024"
+name = "air-quality"
+version = "0.1.0"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# Embassy async runtime & core
+embassy-executor = { version = "0.9.1", features = ["arch-cortex-m", "executor-thread"] }
+embassy-futures = "0.1.2"
+embassy-rp = { version = "0.9.0", features = ["time-driver", "critical-section-impl", "rp2040", "unstable-pac"] }
+embassy-time = "0.5.0"
+embassy-sync = "0.7.0"
+embassy-net = { version = "0.7.1", features = ["tcp", "udp", "dns", "dhcpv4", "defmt", "proto-ipv4"] }
+
+# WiFi support for Pico W (CYW43439)
+cyw43 = { version = "0.6.0", features = ["defmt"] }
+cyw43-pio = { version = "0.9.0", features = ["defmt"] }
+
+# ARM Cortex-M support
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.5"
+
+# Debugging & logging
+defmt = "1.0.1"
+defmt-rtt = "1.0"
+
+# Utilities
+static_cell = "2.1"
+portable-atomic = { version = "1.11.1", features = ["critical-section"] }
+heapless = { version = "0.8", features = ["serde"] }
+critical-section = "1.2.0"
+
+# I2C driver traits (SEN55)
+embedded-hal-async = "1.0"
+
+# I/O and serialization
+embedded-io-async = { version = "0.6.1", features = ["defmt-03"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde-json-core = "0.6"
+
+# HTTP server
+picoserve = { version = "0.17.1", features = ["embassy", "defmt", "json"] }
+
+# NTP time sync (git version has flexible embassy-net >=0.5 requirement)
+sntpc = { git = "https://github.com/vpetrigo/sntpc", default-features = false, features = ["embassy-socket", "defmt"] }
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "s"
+
+[profile.dev]
+debug = 2
+lto = true
+opt-level = "s"

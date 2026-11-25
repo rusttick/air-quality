@@ -1,0 +1,20 @@
+[default.general]
+chip = "RP2040"
+
+[default.probe]
+protocol = "Swd"
+speed = 4000
+
+[default.flashing]
+enabled = true
+restore_unwritten_bytes = false
+
+[default.reset]
+enabled = true
+halt_afterwards = false
+
+[default.rtt]
+enabled = true
+
+[default.gdb]
+enabled = false
