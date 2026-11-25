@@ -44,9 +44,6 @@ serde-json-core = "0.6"
 # HTTP server
 picoserve = { version = "0.17.1", features = ["embassy", "defmt", "json"] }
 
-# NTP time sync (git version has flexible embassy-net >=0.5 requirement)
-sntpc = { git = "https://github.com/vpetrigo/sntpc", default-features = false, features = ["embassy-socket", "defmt"] }
-
 [profile.release]
 debug = 2
 lto = true

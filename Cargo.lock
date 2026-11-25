@@ -35,7 +35,6 @@ dependencies = [
  "portable-atomic",
  "serde",
  "serde-json-core",
- "sntpc",
  "static_cell",
 ]
 
@@ -1466,16 +1465,6 @@ dependencies = [
  "defmt 0.3.100",
  "heapless 0.8.0",
  "managed",
-]
-
-[[package]]
-name = "sntpc"
-version = "0.7.0"
-source = "git+https://github.com/vpetrigo/sntpc#4a9b9d3519a04a9444ed3f997d3211e227894511"
-dependencies = [
- "cfg-if",
- "defmt 1.0.1",
- "embassy-net",
 ]
 
 [[package]]

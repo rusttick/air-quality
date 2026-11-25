@@ -1,7 +1,6 @@
 #![no_std]
 
 pub mod health;
-pub mod ntp;
 pub mod sen55;
 pub mod sensor_task;
 pub mod temp_task;
@@ -39,24 +38,6 @@ pub fn uptime_secs() -> u64 {
     let boot_ticks = BOOT_TICKS.load(Ordering::Relaxed);
     let boot = Instant::from_ticks(boot_ticks);
     boot.elapsed().as_secs()
-}
-
-// Unix time tracking - stores unix timestamp at boot (computed from NTP sync)
-static UNIX_AT_BOOT: AtomicU64 = AtomicU64::new(0);
-
-/// Called by NTP task when time is synced
-pub fn set_unix_time(unix_secs: u64) {
-    let unix_at_boot = unix_secs.saturating_sub(uptime_secs());
-    UNIX_AT_BOOT.store(unix_at_boot, Ordering::Relaxed);
-}
-
-/// Get current Unix time (0 if NTP hasn't synced yet)
-pub fn unix_time() -> u64 {
-    let unix_at_boot = UNIX_AT_BOOT.load(Ordering::Relaxed);
-    if unix_at_boot == 0 {
-        return 0;
-    }
-    unix_at_boot + uptime_secs()
 }
 
 /// MCU temperature in 0.1°C units (e.g. 325 = 32.5°C), updated by temp_task

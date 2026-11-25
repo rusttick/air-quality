@@ -1,8 +1,8 @@
 # SEN55 — Electrical & Data Interface Summary
 
-Condensed from the Sensirion docs in [`ref/`](ref/). Primary source is the
-datasheet (`ref/Sensirion_Datasheet_Environmental_Node_SEN5x.pdf`, v2 March 2022);
-other sources noted inline.
+Condensed from the Sensirion SEN5x documents (product page:
+https://sensirion.com/products/catalog/SEN55). Primary source is the
+[datasheet](https://sensirion.com/media/documents/6791EFA0/62A1F68F/Sensirion_Datasheet_Environmental_Node_SEN5x.pdf) (v2, March 2022); other sources linked inline.
 
 ## 1. Electrical
 
@@ -100,8 +100,8 @@ Otherwise, go through Idle.
 | 0xD210 | Clear Device Status | 20 ms | |
 | 0xD304 | Device Reset | 100 ms | |
 
-¹ `ref/Sensirion_SEN5x_Read_Mass_and_Number_Concentrations.pdf` (not in the datasheet)
-² `ref/PS_AN_Read_RHT_VOC_and_NOx_RAW_signals_v2_D1.pdf` (not in the datasheet)
+¹ [Sensirion_SEN5x_Read_Mass_and_Number_Concentrations.pdf](https://sensirion.com/media/documents/DC018826/637B94B8/Sensirion_SEN5x_Read_Mass_and_Number_Concentrations.pdf) (not in the datasheet)
+² [PS_AN_Read_RHT_VOC_and_NOx_RAW_signals_v2_D1.pdf](https://sensirion.com/media/documents/2B6FC1F3/649C3D0E/PS_AN_Read_RHT_VOC_and_NOx_RAW_signals_v2_D1.pdf) (not in the datasheet)
 
 ### Device Status Register (0xD206)
 | Bit | Name | Meaning | Auto-clears? |
@@ -155,14 +155,14 @@ Raw NOx reads 0xFFFF for the first 10–11 s. No specifications are given for ra
 - Start-up: 8 s at normal concentrations, up to 30 s in very clean air (50–100 #/cm³).
   Discard readings from that window.
 - Values freeze for 10 s during fan cleaning (status bit 19).
-- Spec definitions: `ref/Sensirion_Particulate_Matter_AppNotes_Specification_Statement.pdf`
+- Spec definitions: [Sensirion_Particulate_Matter_AppNotes_Specification_Statement.pdf](https://sensirion.com/media/documents/B7AAA101/61653FB8/Sensirion_Particulate_Matter_AppNotes_Specification_Statement.pdf)
 
 ### Temperature & humidity
 - Accuracy: ±0.45 °C typ (±0.7 max) at 15–30 °C. ±4.5 %RH typ (±6 max) at 30–70 %RH.
 - The default compensation assumes a **bare module in free air**. In an enclosure, tune
   the offset and slope (0x60B2), the acceleration mode (0x60F7) and warm start (0x60C6)
   against a reference. See
-  `ref/Sensirion_Temperature_Acceleration_and_Compensation_Instructions_SEN.pdf`.
+  [Sensirion_Temperature_Acceleration_and_Compensation_Instructions_SEN.pdf](https://sensirion.com/media/documents/9B9DE2A7/61E957EB/Sensirion_Temperature_Acceleration_and_Compensation_Instructions_SEN.pdf).
 
 ### VOC Index (1–500)
 - **A relative value, not a concentration.** 100 is the average of the past 24 hours.
@@ -172,8 +172,8 @@ Raw NOx reads 0xFFFF for the first 10–11 s. No specifications are given for ra
   algorithm state with 0x6181 and restore it before the next start.
 - Device-to-device variation: ±15 points or ±15%.
 - Don't convert it to ppb or tVOC. MOX sensors are broadband, so error can exceed a
-  factor of 2. (`ref/Info_Note_Output_MOX_Sensor.pdf`)
-- For RESET/WELL reporting only, see `ref/GAS_AN_SGP4x_BuildingStandards_D1_1.pdf`
+  factor of 2. ([Info_Note_Output_MOX_Sensor.pdf](https://sensirion.com/media/documents/D27F03C0/6294E00F/Info_Note_Output_MOX_Sensor.pdf))
+- For RESET/WELL reporting only, see [GAS_AN_SGP4x_BuildingStandards_D1_1.pdf](https://sensirion.com/media/documents/4B4D0E67/6520038C/GAS_AN_SGP4x_BuildingStandards_D1_1.pdf)
   for the lab-conditions mapping from VOC Index to TVOC.
 
 ### NOx Index (1–500)
@@ -195,4 +195,4 @@ Raw NOx reads 0xFFFF for the first 10–11 s. No specifications are given for ra
 
 To save power, alternate Measurement mode with RHT/Gas-only mode. This cuts average
 current 7–9× and still allows for PM start-up time. See
-`ref/Reduced_Power_Operation_SEN5x.pdf`.
+[Reduced_Power_Operation_SEN5x.pdf](https://sensirion.com/media/documents/1B417576/62F0B936/Reduced_Power_Operation_SEN5x.pdf).

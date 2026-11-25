@@ -5,7 +5,10 @@
 //! JSON over HTTP.
 //!
 //! Multicore architecture:
-//! - Core 0: WiFi, web server, NTP, MCU temperature, watchdog
+//! - Core 0: WiFi, web server, MCU temperature, watchdog
+//!
+//! No wall-clock time on the device: the polling service timestamps readings
+//! (each reading reports `age_secs`).
 //! - Core 1: one SEN55 task per I2C bus
 //!
 //! Core 1 publishes readings to `SENSOR_DATA[i]` (embassy-sync Watch, critical-section
@@ -46,14 +49,13 @@ use portable_atomic::Ordering;
 use static_cell::StaticCell;
 
 use air_quality::health::{self, WifiState};
-use air_quality::ntp;
 use air_quality::sensor_task::{
     SENSOR_ERRORS, SENSOR_ONLINE, Sensor0Resources, Sensor1Resources, sensor0_task, sensor1_task,
 };
 use air_quality::temp_task::temp_task;
 use air_quality::{
     Irqs, NUM_SENSORS, SENSOR_DATA, SENSOR_INFO, SENSOR_NAMES, SensorData, SensorInfo,
-    TEMP_DECI_C, init_boot_time, unix_time, uptime_secs,
+    TEMP_DECI_C, init_boot_time, uptime_secs,
 };
 
 // WiFi credentials - set via environment variables at build time
@@ -96,7 +98,6 @@ struct SensorStatus {
 #[derive(serde::Serialize)]
 struct StatusResponse {
     uptime_secs: u64,
-    time_unix: u64,
     /// RP2040 internal temperature [°C]
     mcu_temp_c: f64,
     last_reset: &'static str,
@@ -115,14 +116,12 @@ struct SensorReading {
 /// GET /api/air
 #[derive(serde::Serialize)]
 struct AirResponse {
-    time_unix: u64,
     sensors: [SensorReading; NUM_SENSORS],
 }
 
 async fn status_handler() -> impl IntoResponse {
     let status = StatusResponse {
         uptime_secs: uptime_secs(),
-        time_unix: unix_time(),
         mcu_temp_c: TEMP_DECI_C.load(Ordering::Relaxed) as f64 / 10.0,
         last_reset: health::reset_cause().as_str(),
         sensors: core::array::from_fn(|i| SensorStatus {
@@ -138,7 +137,6 @@ async fn status_handler() -> impl IntoResponse {
 async fn air_handler() -> impl IntoResponse {
     let now = uptime_secs();
     let air = AirResponse {
-        time_unix: unix_time(),
         sensors: core::array::from_fn(|i| {
             let reading = SENSOR_DATA[i].try_get();
             SensorReading {
@@ -297,7 +295,7 @@ async fn core0_main_task(
         dns_servers: heapless::Vec::from_slice(&[dns_server]).unwrap(),
     });
 
-    // Sockets: web server (1) + NTP (1) + DNS (1) + spare
+    // Sockets: web server (1) + DNS (1) + spare
     static STACK_RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
 
     info!("configure network: {:?}", net_config);
@@ -312,9 +310,6 @@ async fn core0_main_task(
     spawner.spawn(net_task(runner)).ok();
 
     join_wifi(&mut control, stack).await;
-
-    info!("start NTP");
-    ntp::init(&spawner, stack);
 
     info!("start the web server");
     let app = make_static!(AppRouter<WebApp>, WebApp.build_app());

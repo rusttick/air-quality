@@ -4,17 +4,13 @@ Two Sensirion SEN55 air quality sensors, one before (`inlet`) and one after (`ou
 filter, on a Raspberry Pi Pico W (RP2040 + CYW43439), in Rust with embassy. Serves readings as
 JSON over WiFi.
 
-Project setup (toolchain, `cargo embed`, flip-link, cyw43 firmware, watchdog/health, NTP) is
-copied from `../lights`.
-
-- Sensor interface summary: [doc/sen55_interface.md](doc/sen55_interface.md)
-- Sensirion reference docs: [doc/ref/](doc/ref/) ([index](doc/ref/doc_index.md))
+Sensor interface summary: [doc/sen55_interface.md](doc/sen55_interface.md)
 
 ## Architecture
 
 | Core | Tasks |
 |---|---|
-| 0 | WiFi (cyw43 on PIO0 + DMA_CH0), embassy-net, picoserve web server, NTP, MCU temp, watchdog |
+| 0 | WiFi (cyw43 on PIO0 + DMA_CH0), embassy-net, picoserve web server, MCU temp, watchdog |
 | 1 | `sensor0_task` (inlet, I2C0) and `sensor1_task` (outlet, I2C1), 1 Hz each |
 
 The SEN55's I2C address (0x69) is fixed, so each sensor gets its own hardware I2C bus. Both tasks
@@ -65,11 +61,13 @@ cargo run            # or: probe-rs run (runner in .cargo/config.toml)
 
 CORS is open (`*`). All values are JSON; unknown/invalid sensor values are `null`.
 
+The device has no wall-clock time. The polling service should timestamp each reading
+as `its own clock - age_secs`.
+
 ### `GET /api/air`
 One entry per sensor, in index order (`inlet`, then `outlet`):
 ```json
 {
-  "time_unix": 1764000000,
   "sensors": [
     { "name": "inlet", "age_secs": 0, "reading": {
     "seq": 123, "uptime_secs": 130, "measuring_secs": 125,
@@ -97,7 +95,7 @@ PM is stable after ~30 s, the VOC Index meets spec after ~1 h, the NOx Index aft
 ### `GET /api/status`
 ```json
 {
-  "uptime_secs": 130, "time_unix": 1764000000, "mcu_temp_c": 27.4,
+  "uptime_secs": 130, "mcu_temp_c": 27.4,
   "last_reset": "power_on",
   "sensors": [
     { "name": "inlet",  "online": true, "errors": 0,
