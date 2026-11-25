@@ -17,7 +17,8 @@
 //! After `MAX_CONSECUTIVE_ERRORS` failed cycles the sensor is re-initialized,
 //! so unplugging / replugging a sensor recovers without a reboot.
 //!
-//! Both sensors: VDD = 5 V (VBUS), SEL = GND, ~10 kΩ pull-ups to 3V3 on SDA/SCL.
+//! Both sensors: VDD = 5 V (VBUS), SEL = GND, external pull-ups to 3V3 on SDA/SCL
+//! (3.3 kΩ for ~3 m cables, see doc/wiring_cat6.md and doc/wiring_svideo.md).
 
 use defmt::{info, warn, Debug2Format};
 use embassy_rp::i2c::{self, I2c};
@@ -34,16 +35,18 @@ use crate::{
     SENSOR_NAMES,
 };
 
-/// SEN55 maximum I2C speed (standard mode)
-const I2C_FREQUENCY: u32 = 100_000;
+/// I2C clock. The SEN55 allows up to 100 kHz; 10 kHz gives a large margin on
+/// long cables (~3 m) and one read cycle still takes only ~150 ms.
+/// Avoid values near 18.3 kHz: embassy-rp's glitch filter length wraps to 0 there.
+const I2C_FREQUENCY: u32 = 10_000;
 
 /// Loop period; the SEN55 produces a new reading every second
 const PERIOD: Duration = Duration::from_secs(1);
 
-/// Upper bound for one init sequence (reset 100 ms + reads + start 50 ms)
+/// Upper bound for one init sequence (~350 ms at 10 kHz: reset 100 ms + reads + start 50 ms)
 const INIT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Upper bound for one read cycle (normally ~70 ms)
+/// Upper bound for one read cycle (~150 ms at 10 kHz)
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Read the device status register every N cycles
@@ -78,6 +81,10 @@ pub struct Sensor1Resources {
 fn i2c_config() -> i2c::Config {
     let mut config = i2c::Config::default();
     config.frequency = I2C_FREQUENCY;
+    // embassy-rp enables the RP2040's internal pull-ups by default; the board
+    // has external pull-ups sized for the cable, so turn the internal ones off
+    config.sda_pullup = false;
+    config.scl_pullup = false;
     config
 }
 
